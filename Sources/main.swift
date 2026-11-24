@@ -23,6 +23,11 @@ final class Controller: NSObject, NSApplicationDelegate {
     // Sleep and wake flip the panel by themselves; those flips are not the user's.
     private var ignoreFlipsUntil = Date.distantPast
     private var asleep = false
+    // Until this moment a wake is still considered in progress: the built-in
+    // may only be switched off once the external is the main display again.
+    private var wakeWindowUntil = Date.distantPast
+    // Software re-plugs (external disable/enable) left for this wake.
+    private var kicksLeft = 0
     private var misses = 0
     private var nextRestore = Date.distantPast
     private var lastSummary = ""
@@ -48,6 +53,9 @@ final class Controller: NSObject, NSApplicationDelegate {
         defaults.register(defaults: ["autoOffOnConnect": true])
         lastBuiltInID = CGDirectDisplayID(defaults.integer(forKey: "lastBuiltInID"))
         recoveryOwed = defaults.bool(forKey: "recoveryOwed")
+        // A recovery restarts the process; the wake window must survive it.
+        wakeWindowUntil = Date(timeIntervalSince1970: defaults.double(forKey: "wakeWindowUntil"))
+        kicksLeft = defaults.integer(forKey: "kicksLeft")
         super.init()
     }
 
@@ -89,9 +97,23 @@ final class Controller: NSObject, NSApplicationDelegate {
         for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
             center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 log(name.rawValue)
-                self?.asleep = false
-                self?.ignoreFlipsUntil = Date().addingTimeInterval(8)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self?.applyPolicy(reason: "wake") }
+                guard let self else { return }
+                self.asleep = false
+                self.ignoreFlipsUntil = Date().addingTimeInterval(8)
+                // While a wake is in progress the built-in may only be
+                // switched off once the external is the main display again,
+                // and the external gets software re-plugged until then (see
+                // applyPolicy). The built-in is only turned on as a fallback
+                // when the external actually failed, never by default.
+                let windowEnd = Date().addingTimeInterval(90)
+                if windowEnd > self.wakeWindowUntil {
+                    self.wakeWindowUntil = windowEnd
+                    self.defaults.set(windowEnd.timeIntervalSince1970, forKey: "wakeWindowUntil")
+                    self.kicksLeft = 3
+                    self.defaults.set(self.kicksLeft, forKey: "kicksLeft")
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.applyPolicy(reason: "wake") }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 31) { self.applyPolicy(reason: "wake") }
             }
         }
 
@@ -229,6 +251,27 @@ final class Controller: NSObject, NSApplicationDelegate {
         let s = Snapshot()
         guard !s.externals.isEmpty, !temporary else { return }
         let wantOn = builtInShouldBeOn(s)
+        // The built-in may only be switched off while the external is the main
+        // display: after a bad wake macOS can hand the desktop to the built-in
+        // and leave the external an empty black screen (cursor only, no lock
+        // window). During the wake window the external is software re-plugged
+        // until it is main again — the same thing a cable re-plug fixes.
+        if !wantOn, CGDisplayIsBuiltin(CGMainDisplayID()) != 0, Date() < wakeWindowUntil {
+            guard kicksLeft > 0 else {
+                log("\(reason): external never became main; keeping the built-in on")
+                return
+            }
+            kicksLeft -= 1
+            defaults.set(kicksLeft, forKey: "kicksLeft")
+            if !s.builtInOn, let id = s.builtIn ?? cachedBuiltIn {
+                log("kick: built-in on first \(setEnabled(id, true).rawValue)")
+            }
+            for id in s.externals {
+                log("kick: software re-plug #\(id) off=\(setEnabled(id, false).rawValue) on=\(setEnabled(id, true).rawValue)")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.applyPolicy(reason: reason) }
+            return
+        }
         guard wantOn != s.builtInOn, let id = s.builtIn ?? cachedBuiltIn else { return }
         ignoreFlipsUntil = Date().addingTimeInterval(4)
         log("\(reason): built-in \(wantOn ? "on" : "off") \(setEnabled(id, wantOn).rawValue)")

@@ -97,7 +97,7 @@ struct Snapshot {
             CGDisplayIsBuiltin($0) == 0 && isMonitor(vendor: CGDisplayVendorNumber($0)) && CGDisplayIsActive($0) != 0
         }
         externalKeys = externals.map(key(of:))
-        summary = ids.map { id in
+        summary = "main=\(CGDisplayIsBuiltin(CGMainDisplayID()) != 0 ? "built-in" : "external") " + ids.map { id in
             "#\(id)\(CGDisplayIsBuiltin(id) != 0 ? "b" : "e") active=\(CGDisplayIsActive(id))"
                 + " online=\(CGDisplayIsOnline(id)) vendor=\(String(CGDisplayVendorNumber(id), radix: 16))"
                 + " model=\(String(CGDisplayModelNumber(id), radix: 16))"
