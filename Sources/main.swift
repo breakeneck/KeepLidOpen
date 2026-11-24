@@ -28,6 +28,10 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var wakeWindowUntil = Date.distantPast
     // Software re-plugs (external disable/enable) left for this wake.
     private var kicksLeft = 0
+    // This wake showed a placeholder display: the external may be black with
+    // only a cursor even while it reports itself main, so it gets re-plugged
+    // regardless of which display is main (see applyPolicy).
+    private var badWake = false
     private var misses = 0
     private var nextRestore = Date.distantPast
     private var lastSummary = ""
@@ -56,6 +60,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         // A recovery restarts the process; the wake window must survive it.
         wakeWindowUntil = Date(timeIntervalSince1970: defaults.double(forKey: "wakeWindowUntil"))
         kicksLeft = defaults.integer(forKey: "kicksLeft")
+        badWake = defaults.bool(forKey: "badWake")
         super.init()
     }
 
@@ -111,6 +116,8 @@ final class Controller: NSObject, NSApplicationDelegate {
                     self.defaults.set(windowEnd.timeIntervalSince1970, forKey: "wakeWindowUntil")
                     self.kicksLeft = 3
                     self.defaults.set(self.kicksLeft, forKey: "kicksLeft")
+                    self.badWake = false
+                    self.defaults.set(false, forKey: "badWake")
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.applyPolicy(reason: "wake") }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 31) { self.applyPolicy(reason: "wake") }
@@ -153,6 +160,14 @@ final class Controller: NSObject, NSApplicationDelegate {
         if s.summary != lastSummary {
             log("displays: \(s.summary)")
             lastSummary = s.summary
+        }
+        // A placeholder display during the wake window means the handover broke
+        // even if the external claims to be main: remember it across the
+        // recovery restart so the external still gets software re-plugged.
+        if Date() < wakeWindowUntil, s.phantomSeen, !badWake {
+            badWake = true
+            defaults.set(true, forKey: "badWake")
+            log("bad wake: placeholder display seen during the wake window")
         }
         if let id = s.builtIn, id != lastBuiltInID {
             lastBuiltInID = id
@@ -251,26 +266,36 @@ final class Controller: NSObject, NSApplicationDelegate {
         let s = Snapshot()
         guard !s.externals.isEmpty, !temporary else { return }
         let wantOn = builtInShouldBeOn(s)
-        // The built-in may only be switched off while the external is the main
-        // display: after a bad wake macOS can hand the desktop to the built-in
-        // and leave the external an empty black screen (cursor only, no lock
-        // window). During the wake window the external is software re-plugged
-        // until it is main again — the same thing a cable re-plug fixes.
-        if !wantOn, CGDisplayIsBuiltin(CGMainDisplayID()) != 0, Date() < wakeWindowUntil {
-            guard kicksLeft > 0 else {
-                log("\(reason): external never became main; keeping the built-in on")
+        // The built-in may only be switched off once the wake is healthy: after a
+        // bad wake macOS can hand the desktop to the built-in and leave the
+        // external an empty black screen (cursor only, no lock window), or
+        // keep the external nominally main while the desktop is stranded on a
+        // placeholder display. Either way the external is software re-plugged
+        // — the same thing a cable re-plug fixes — until it is main again or
+        // the re-plugs run out.
+        let mainIsBuiltIn = CGDisplayIsBuiltin(CGMainDisplayID()) != 0
+        if !wantOn, (mainIsBuiltIn || badWake), Date() < wakeWindowUntil {
+            if kicksLeft == 0 {
+                if mainIsBuiltIn {
+                    log("\(reason): external never became main; keeping the built-in on")
+                    return
+                }
+                // The external is main already and the re-plugs are spent:
+                // there is nothing left to verify, so trust it and proceed.
+                badWake = false
+                defaults.set(false, forKey: "badWake")
+            } else {
+                kicksLeft -= 1
+                defaults.set(kicksLeft, forKey: "kicksLeft")
+                if !s.builtInOn, let id = s.builtIn ?? cachedBuiltIn {
+                    log("kick: built-in on first \(setEnabled(id, true).rawValue)")
+                }
+                for id in s.externals {
+                    log("kick: software re-plug #\(id) off=\(setEnabled(id, false).rawValue) on=\(setEnabled(id, true).rawValue)")
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.applyPolicy(reason: reason) }
                 return
             }
-            kicksLeft -= 1
-            defaults.set(kicksLeft, forKey: "kicksLeft")
-            if !s.builtInOn, let id = s.builtIn ?? cachedBuiltIn {
-                log("kick: built-in on first \(setEnabled(id, true).rawValue)")
-            }
-            for id in s.externals {
-                log("kick: software re-plug #\(id) off=\(setEnabled(id, false).rawValue) on=\(setEnabled(id, true).rawValue)")
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.applyPolicy(reason: reason) }
-            return
         }
         guard wantOn != s.builtInOn, let id = s.builtIn ?? cachedBuiltIn else { return }
         ignoreFlipsUntil = Date().addingTimeInterval(4)

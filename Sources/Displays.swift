@@ -87,12 +87,21 @@ struct Snapshot {
     let builtInOn: Bool
     let externals: [CGDirectDisplayID]
     let externalKeys: [String]
+    /// An active non-built-in display with a placeholder vendor (the "unkn/virt"
+    /// screen macOS shows when the real monitor is not ready). Seeing one right
+    /// after a wake means the display handover broke, even when the external
+    /// still reports itself as main and active — the black-with-cursor case.
+    let phantomSeen: Bool
     let summary: String
 
     init() {
         let ids = displayIDs()
         builtIn = ids.first { CGDisplayIsBuiltin($0) != 0 }
         builtInOn = builtIn.map { CGDisplayIsOnline($0) != 0 } ?? false
+        phantomSeen = ids.contains {
+            CGDisplayIsBuiltin($0) == 0 && !isMonitor(vendor: CGDisplayVendorNumber($0))
+                && CGDisplayIsActive($0) != 0
+        }
         externals = ids.filter {
             CGDisplayIsBuiltin($0) == 0 && isMonitor(vendor: CGDisplayVendorNumber($0)) && CGDisplayIsActive($0) != 0
         }
